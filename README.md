@@ -8,7 +8,7 @@ In particular, the kind of problems it tackles have the following properties:
 0. We wish to maximize cumulative reward;
 1. Feedback is slow and expensive;
 2. The reward varies depending on a single choice, and can be estimated given some context;
-3. The choice is not defined by a discrete set of actions, but by a continuous parameter $p$.
+3. The choice is not defined by a discrete set of actions, but by a continuous parameter *p*.
 
 This can be thought of as a variation on the contextual multi-armed bandit formulation, where instead of deciding which arm to pull, we decide how much.
 
