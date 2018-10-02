@@ -168,6 +168,185 @@ class SimpleAgent:
         elif self.loss_type == 'mse':
             return np.mean((y - self.predict(X, p, batch_size)) ** 2)
 
+class FiLMLayer(tf.keras.layers.Layer):
+
+    def __init__(self, p, axis=-1, **kwargs):
+        super(FiLMLayer, self).__init__(**kwargs)
+        self.axis = axis
+        self.p = tf.reshape(p, (-1, 1))
+
+    def build(self, input_shape):
+        shape = (input_shape[self.axis].value,)
+        self.gamma = self.add_variable("gamma", shape=shape, dtype=tf.float32)
+        self.beta = self.add_variable("beta", shape=shape, dtype=tf.float32)
+        super(FiLMLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        return (self.gamma * inputs + self.beta) * self.p
+
+class FiLMAgent:
+
+    def __init__(self, layer_width=16, n_layers=1, dropout=0, loss='mse'):
+        self.layer_width = layer_width
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.loss_type = loss
+        self._ready = False
+
+    def _build(self):
+        tf.reset_default_graph()
+        self._x_in = tf.placeholder(tf.float32, shape=(None, self.n_features), name='features_in')
+        self._p_in = tf.placeholder(tf.float32, shape=(None,), name='parameter_in')
+        self._r_in = tf.placeholder_with_default(tf.zeros_like(self._p_in),
+                                                 shape=(None,), name='rewards_in')
+        self._train = tf.placeholder(tf.bool, shape=(), name='train_mode_switch')
+        self._batch_size = tf.placeholder_with_default(tf.zeros((), dtype=tf.int64),
+                                                       shape=(), name='batch_size')
+        self._n_epochs = tf.placeholder_with_default(tf.zeros((), dtype=tf.int64),
+                                                     shape=(), name='n_epochs')
+        self._global_step = tf.Variable(0, name='global_step', trainable=False)
+
+        def train_path():
+            it = (tf.data.Dataset
+                         .from_tensor_slices((self._x_in, self._p_in, self._r_in))
+                         .shuffle(buffer_size=100000)
+                         .batch(self._batch_size)
+                         .repeat(self._n_epochs)
+                    .make_initializable_iterator())
+            return (*it.get_next(), it.initializer)
+
+        def pred_path():
+            it = (tf.data.Dataset
+                         .from_tensor_slices((self._x_in, self._p_in, self._r_in))
+                         .batch(self._batch_size)
+                    .make_initializable_iterator())
+            return (*it.get_next(), it.initializer)
+
+        x, p, r, self._it_init_op = tf.cond(self._train, train_path, pred_path)
+        film_layer = FiLMLayer(p)
+
+        for i in range(self.n_layers):
+            x = tf.layers.Dense(self.layer_width, activation='elu', name=f'layer_{i}')(x)
+            if self.dropout > 0:
+                x = tf.layers.Dropout(self.dropout)(x)
+            x = film_layer(x)
+
+        if self.loss_type == 'mse':
+            self._r_out = tf.squeeze(tf.layers.Dense(1, name=f'rewards_out')(x))
+            self._loss = tf.losses.mean_squared_error(r, self._r_out)
+        elif self.loss_type == 'ce':
+            logits = tf.squeeze(tf.layers.Dense(1, name=f'rewards_out')(x))
+            self._r_out = tf.sigmoid(logits)
+            self._loss = tf.losses.sigmoid_cross_entropy(r, logits)
+        else:
+            raise RuntimeError("Invalid loss type.")
+
+        self._train_op = (tf.train.AdamOptimizer()
+                                  .minimize(self._loss, global_step=self._global_step))
+
+    def fit(self, X, p, r, bins=None, batch_size=32, n_epochs=1):
+
+        X = np.asanyarray(X, dtype=np.float32)
+        p = np.asanyarray(p, dtype=np.float32)
+        r = np.asanyarray(r, dtype=np.float32)
+
+        assert X.ndim == 2, "Incompatible features tensor, expected rank 2 (i.e. a matrix)."
+        assert p.ndim == 1, "Incompatible parameters tensor, expected rank 1 (i.e. a vector)."
+        assert r.ndim == 1, "Incompatible rewards tensor, expected rank 1 (i.e. a vector)."
+
+        xlen, n_features = X.shape
+
+        if not self._ready or n_features != self.n_features:
+            if self._ready:
+                warnings.warn("Replacing model due to new X shape.", RuntimeWarning)
+
+            self.n_features = n_features
+            self._build()
+
+            self._sess = tf.Session()
+            self._sess.run(tf.global_variables_initializer())
+            self._ready = True
+
+        self._sess.run(self._it_init_op, feed_dict={
+            self._x_in: X, self._p_in: p, self._r_in: r,
+            self._train: True, self._batch_size: batch_size, self._n_epochs: n_epochs
+        })
+
+        batches_per_epoch = np.ceil(xlen / batch_size).astype(int)
+
+        losses = []
+        while True:
+            try:
+                step, loss, _ = self._sess.run(
+                    [self._global_step, self._loss, self._train_op],
+                    feed_dict={self._train: True}
+                )
+                losses.append(loss)
+                if step % batches_per_epoch == 0:
+                    epoch = step // batches_per_epoch
+                    print(f"@{epoch}: loss={np.mean(losses)}")
+                    losses = []
+            except tf.errors.OutOfRangeError:
+                break
+
+    def predict(self, X, p, batch_size=128):
+
+        assert self._ready, "Must fit model first."
+
+        self._sess.run(self._it_init_op, feed_dict={
+            self._x_in: X,
+            self._p_in: p,
+            self._train: False,
+            self._batch_size: batch_size
+        })
+
+        batches = []
+        while True:
+            try:
+                batches.append(self._sess.run(self._r_out, feed_dict={self._train: False}))
+            except tf.errors.OutOfRangeError:
+                break
+
+        return np.concatenate(batches, axis=0)
+
+    def estimate_curve(self, X, span, n_samples=100, batch_size=128):
+        space = np.linspace(*span, n_samples)
+        X_long = np.tile(X, n_samples).reshape(-1, X.shape[1])
+        p_long = np.tile(space, (X.shape[0], 1)).flatten()
+        return space, self.predict(X_long, p_long, batch_size).reshape(-1, n_samples)
+
+    def estimate_best_p(self, X, span, n_samples=100, batch_size=128):
+        space, y_curve = self.estimate_curve(X, span, n_samples, batch_size)
+        return space[np.argmax(y_curve, axis=1)]
+
+    def evaluate(self, X, p, y, batch_size=128, eps=1e-5):
+        """Evaluate the correctness of the estimated rewards.
+
+        Parameters
+        ----------
+        X : ndarray
+            The features matrix.
+        p : ndarray
+            The parameters tried (may be more than 1 for each X row).
+        y : ndarray
+            The true rewards (same shape as p).
+        batch_size : int
+            The batch size for the prediction pipeline.
+        eps : float, optional
+            Small positive number to compute cross entropy with.
+            Only meaningful when loss type is 'ce'.
+
+        Returns
+        -------
+        float
+            The loss over the estimated and true rewards.
+        """
+        if self.loss_type == 'ce':
+            y_pred = np.clip(self.predict(X, p, batch_size), eps, 1-eps)
+            return -np.mean(y * np.log(y_pred) + (1 - y) * np.log(1 - y_pred))
+        elif self.loss_type == 'mse':
+            return np.mean((y - self.predict(X, p, batch_size)) ** 2)
+
 class MultiHeadAgent:
     """Multiheaded neural network that attempts to maximize reward.
 
